@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Standalone CLI entry point: build, train, and evaluate the Transformer classifier.
+Entry point for training and evaluating the Transformer classifier.
 
-Usage
------
+Usage:
     python run.py           # uses v1 config by default
-    python run.py -v v1     # explicitly use model_configs_v1.py
-    python run.py -v v2     # use model_configs_v2.py
+    python run.py -v v1     # loads model_configs/model_configs_v1.py
+    python run.py -v v2     # loads model_configs/model_configs_v2.py
 
-The -v flag dynamically imports model_configs_{version}.py from model_configs/.
-Checkpoints are saved to models/. Results (plots, metrics) go to results/{model_tag}/.
+If a checkpoint already exists for the model tag, training is skipped and
+evaluation runs directly on the held-out test set.
 """
 
 import argparse
@@ -23,7 +22,6 @@ import torch
 
 import CONFIG
 
-# Allow importing configs from model_configs/
 sys.path.insert(0, CONFIG.model_configs_dir)
 
 from data     import make_dataloaders
@@ -32,11 +30,8 @@ from train    import run_training
 from evaluate import evaluate_test_set, plot_training_curves
 
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
-
 def set_seed(seed: int) -> None:
+    """Sets random seeds for reproducibility across Python, NumPy, and PyTorch."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -45,7 +40,7 @@ def set_seed(seed: int) -> None:
 
 
 def load_config(version: str) -> tuple[dict, dict]:
-    """Dynamically import model_configs_{version}.py from model_configs/ and return both dicts."""
+    """Imports model_configs_{version}.py from model_configs/ and returns (model_params, model_build_options)."""
     module_name = f'model_configs_{version}'
     try:
         cfg = importlib.import_module(module_name)
@@ -57,25 +52,15 @@ def load_config(version: str) -> tuple[dict, dict]:
     return cfg.model_params, cfg.model_build_options
 
 
-# ──────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(
-        description='Train and evaluate the Transformer AI text detector.'
-    )
-    parser.add_argument(
-        '-v', '--version',
-        default='v1',
-        help='Config version to use, e.g. v1 loads model_configs_v1.py (default: v1)'
-    )
+    parser = argparse.ArgumentParser(description='Train and evaluate the Transformer classifier.')
+    parser.add_argument('-v', '--version', default='v1',
+                        help='Config version to use, e.g. v1 loads model_configs_v1.py (default: v1)')
     args = parser.parse_args()
 
-    # ── Load config ───────────────────────────
     print(f"Loading config: model_configs/model_configs_{args.version}.py")
     model_params, model_build_options = load_config(args.version)
-    model_build_options = dict(model_build_options)   # don't mutate the imported dict
+    model_build_options = dict(model_build_options)
     tag = model_params['model_tag']
     print(f"  model_tag:   {tag}")
     print(f"  d_model:     {model_params['d_model']}")
@@ -84,28 +69,23 @@ def main():
     print(f"  pooling:     {model_params['pooling']}")
     print(f"  max_seq_len: {model_params['max_seq_len']}")
 
-    # ── Resolve output directories ─────────────
-    # Checkpoints → models/best_model_{tag}.pt
     os.makedirs(CONFIG.models_dir, exist_ok=True)
     checkpoint_path = os.path.join(CONFIG.models_dir, f'best_model_{tag}.pt')
-
-    # Results (plots) → results/{tag}/
-    results_dir = os.path.join(CONFIG.results_dir, tag)
+    results_dir     = os.path.join(CONFIG.results_dir, tag)
     os.makedirs(results_dir, exist_ok=True)
+
     model_build_options['results_dir']     = results_dir
     model_build_options['checkpoint_path'] = checkpoint_path
 
     print(f"\n  Checkpoint → {checkpoint_path}")
     print(f"  Results    → {results_dir}/")
 
-    # ── Reproducibility ───────────────────────
     set_seed(model_build_options['seed'])
 
-    # ── Device ────────────────────────────────
     if torch.cuda.is_available():
         device = torch.device('cuda')
     elif torch.backends.mps.is_available():
-        device = torch.device('mps')   # Apple Silicon GPU
+        device = torch.device('mps')
     else:
         device = torch.device('cpu')
     print(f"\nDevice: {device}")
@@ -114,25 +94,18 @@ def main():
     elif device.type == 'mps':
         print(f"  GPU: Apple Silicon (MPS)")
 
-    # ── Data ──────────────────────────────────
     train_loader, val_loader, test_loader = make_dataloaders(model_params, model_build_options)
 
-    # ── Model ─────────────────────────────────
-    model = TransformerClassifier(model_params).to(device)
+    model    = TransformerClassifier(model_params).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel: {tag}  ({n_params:,} parameters)")
 
-    # ── Train ─────────────────────────────────
-    checkpoint_exists = os.path.exists(checkpoint_path)
-    if checkpoint_exists:
+    if os.path.exists(checkpoint_path):
         print(f"\nCheckpoint found — skipping training, running evaluation only.")
         print(f"  ({checkpoint_path})")
         print(f"  Delete the checkpoint to retrain from scratch.")
     else:
-        history = run_training(
-            model, train_loader, val_loader, device,
-            model_params, model_build_options
-        )
+        history = run_training(model, train_loader, val_loader, device, model_params, model_build_options)
 
         if model_build_options.get('save_results', 1):
             curves_path = os.path.join(results_dir, f'training_curves_{tag}.png')
@@ -142,10 +115,7 @@ def main():
                 showplots=bool(model_build_options.get('showplots', 0)),
             )
 
-    # ── Evaluate on test set ──────────────────
-    metrics = evaluate_test_set(
-        model, test_loader, device, model_params, model_build_options
-    )
+    metrics = evaluate_test_set(model, test_loader, device, model_params, model_build_options)
 
     print("\n── Final Metrics ────────────────────────────────")
     print(f"  Accuracy:   {metrics['accuracy']*100:.2f}%")

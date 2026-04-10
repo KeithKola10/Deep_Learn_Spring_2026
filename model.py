@@ -3,23 +3,19 @@
 """
 Transformer encoder classifier built from scratch in PyTorch.
 
-Architecture (bottom-up):
-    TokenEmbedding             — learned embedding table, scaled by sqrt(d_model)
-    SinusoidalPositionalEncoding — fixed sinusoidal PE, registered as buffer
-    MultiHeadSelfAttention     — standard scaled dot-product MHSA with padding mask
-    FeedForward                — 2-layer MLP with GELU activation
-    TransformerEncoderLayer    — Pre-LN: LayerNorm BEFORE each sub-layer (more stable for small models)
-    TransformerClassifier      — stacks N encoder layers, pools, then classifies
+Components:
+    TokenEmbedding             — learned token embedding table
+    SinusoidalPositionalEncoding — fixed positional encodings added to embeddings
+    MultiHeadSelfAttention     — scaled dot-product attention with padding mask
+    FeedForward                — two-layer MLP with GELU activation
+    TransformerEncoderLayer    — pre-LayerNorm encoder block (MHSA + FFN + residuals)
+    TransformerClassifier      — stacks encoder layers, pools, and classifies
 
-Pooling: 'mean' (masked mean over real tokens) or 'cls' (first token).
-Classification head: Linear(d_model, head_hidden_dim) -> GELU -> Dropout -> Linear(head_hidden_dim, 2)
+Pre-LayerNorm: normalisation is applied before each sub-layer rather than after,
+which improves training stability for small models trained from scratch.
 
-Pre-LayerNorm note: unlike the original "Attention Is All You Need" (post-LN),
-pre-LN applies LayerNorm BEFORE the sub-layer, then adds the residual after.
-This is more training-stable without careful LR warm-up tuning.
-
-Padding mask note: nn.MultiheadAttention expects key_padding_mask where True = IGNORE.
-Our attention_mask uses True = REAL TOKEN, so we invert before passing: ~attention_mask.
+Padding mask: attention_mask uses True = real token; this is inverted before
+passing to nn.MultiheadAttention which expects True = ignore.
 """
 
 import math
@@ -32,10 +28,7 @@ import torch.nn as nn
 # ──────────────────────────────────────────────
 
 class TokenEmbedding(nn.Module):
-    """
-    Learned embedding table.
-    Scales output by sqrt(d_model) as in "Attention Is All You Need".
-    """
+    """Maps token IDs to d_model-dimensional vectors, scaled by sqrt(d_model)."""
 
     def __init__(self, vocab_size: int, d_model: int):
         super().__init__()
@@ -43,44 +36,33 @@ class TokenEmbedding(nn.Module):
         self.scale     = math.sqrt(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T] -> [B, T, d_model]
         return self.embedding(x) * self.scale
 
 
 class SinusoidalPositionalEncoding(nn.Module):
-    """
-    Fixed (non-learned) sinusoidal positional encodings.
-    Registered as a buffer so it moves with the model to the correct device.
-    Dropout is applied after adding PE to the embeddings.
-    """
+    """Adds fixed sinusoidal position signals to token embeddings, then applies dropout."""
 
     def __init__(self, d_model: int, max_seq_len: int, dropout: float):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
 
-        # Build [max_seq_len, d_model] PE matrix
         pe  = torch.zeros(max_seq_len, d_model)
-        pos = torch.arange(max_seq_len, dtype=torch.float).unsqueeze(1)           # [T, 1]
+        pos = torch.arange(max_seq_len, dtype=torch.float).unsqueeze(1)
         div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float)
-                        * (-math.log(10000.0) / d_model))                         # [d_model/2]
+                        * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
-        pe = pe.unsqueeze(0)   # [1, T, d_model] — broadcast over batch
-        self.register_buffer('pe', pe)
+        self.register_buffer('pe', pe.unsqueeze(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, d_model]
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)
 
 
 class MultiHeadSelfAttention(nn.Module):
     """
-    Standard scaled dot-product multi-head self-attention.
-    Uses nn.MultiheadAttention internally (batch_first=True).
-
-    key_padding_mask convention: True = IGNORE that position.
-    We receive attention_mask (True = REAL TOKEN) and invert it.
+    Multi-head scaled dot-product self-attention.
+    Padding positions are masked out so they do not influence other tokens.
     """
 
     def __init__(self, d_model: int, n_heads: int, dropout: float):
@@ -92,22 +74,14 @@ class MultiHeadSelfAttention(nn.Module):
             batch_first=True,
         )
 
-    def forward(
-        self,
-        x:               torch.Tensor,   # [B, T, d_model]
-        attention_mask:  torch.Tensor,   # [B, T], True = real token
-    ) -> torch.Tensor:
-        # Invert mask: nn.MultiheadAttention needs True = IGNORE
-        padding_mask = ~attention_mask   # [B, T]
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        padding_mask = ~attention_mask   # invert: nn.MultiheadAttention needs True = ignore
         out, _ = self.attn(x, x, x, key_padding_mask=padding_mask)
         return out
 
 
 class FeedForward(nn.Module):
-    """
-    Position-wise feedforward network.
-    Linear(d_model, d_ff) -> GELU -> Dropout -> Linear(d_ff, d_model)
-    """
+    """Two-layer position-wise MLP: Linear → GELU → Dropout → Linear."""
 
     def __init__(self, d_model: int, d_ff: int, dropout: float):
         super().__init__()
@@ -124,9 +98,7 @@ class FeedForward(nn.Module):
 
 class TransformerEncoderLayer(nn.Module):
     """
-    Single Pre-LayerNorm Transformer encoder layer.
-
-    Pre-LN order (more stable than original post-LN for small from-scratch models):
+    Single encoder layer with pre-LayerNorm and residual connections.
         x = x + MHSA(LayerNorm(x))
         x = x + FFN(LayerNorm(x))
     """
@@ -139,14 +111,8 @@ class TransformerEncoderLayer(nn.Module):
         self.ff    = FeedForward(d_model, d_ff, dropout)
         self.drop  = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x:              torch.Tensor,   # [B, T, d_model]
-        attention_mask: torch.Tensor,   # [B, T]
-    ) -> torch.Tensor:
-        # MHSA sub-layer (pre-LN)
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         x = x + self.drop(self.attn(self.norm1(x), attention_mask))
-        # FFN sub-layer (pre-LN)
         x = x + self.drop(self.ff(self.norm2(x)))
         return x
 
@@ -157,14 +123,9 @@ class TransformerEncoderLayer(nn.Module):
 
 class TransformerClassifier(nn.Module):
     """
-    Full Transformer encoder binary classifier.
-
-    Forward pass:
-        input_ids, attention_mask  ->  logits [B, 2]
-
-    Pooling (set by model_params['pooling']):
-        'mean' — average over real (non-padding) token positions
-        'cls'  — take the representation of position 0 (first token)
+    Transformer encoder for binary classification.
+    Stacks N encoder layers, pools the output, and projects to 2 logits.
+    Pooling mode is set via model_params['pooling']: 'mean' or 'cls'.
     """
 
     def __init__(self, model_params: dict):
@@ -187,10 +148,8 @@ class TransformerClassifier(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Final LayerNorm after all encoder layers (pre-LN models benefit from this)
         self.norm = nn.LayerNorm(d_model)
 
-        # Classification head: d_model -> head_hidden -> 2
         self.head = nn.Sequential(
             nn.Linear(d_model, head_hidden),
             nn.GELU(),
@@ -201,7 +160,7 @@ class TransformerClassifier(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier uniform initialization for linear layers; normal for embeddings."""
+        """Xavier uniform for linear layers, normal distribution for embeddings."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -212,60 +171,43 @@ class TransformerClassifier(nn.Module):
                 if module.padding_idx is not None:
                     module.weight.data[module.padding_idx].zero_()
 
-    def _mean_pool(
-        self,
-        hidden:         torch.Tensor,   # [B, T, d_model]
-        attention_mask: torch.Tensor,   # [B, T], True = real token
-    ) -> torch.Tensor:
-        # [B, T, d_model] masked sum, then divide by real token count
-        mask_f = attention_mask.unsqueeze(-1).float()   # [B, T, 1]
-        summed = (hidden * mask_f).sum(dim=1)           # [B, d_model]
-        count  = mask_f.sum(dim=1).clamp(min=1e-9)     # [B, 1]
-        return summed / count                           # [B, d_model]
+    def _mean_pool(self, hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Averages hidden states over real token positions, ignoring padding."""
+        mask_f = attention_mask.unsqueeze(-1).float()
+        summed = (hidden * mask_f).sum(dim=1)
+        count  = mask_f.sum(dim=1).clamp(min=1e-9)
+        return summed / count
 
-    def forward(
-        self,
-        input_ids:      torch.Tensor,   # [B, T]
-        attention_mask: torch.Tensor,   # [B, T], True = real token
-    ) -> torch.Tensor:
-        x = self.embed(input_ids)       # [B, T, d_model]
-        x = self.pe(x)                  # [B, T, d_model]
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Returns class logits of shape [batch, 2]."""
+        x = self.embed(input_ids)
+        x = self.pe(x)
 
         for layer in self.layers:
             x = layer(x, attention_mask)
 
-        x = self.norm(x)                # [B, T, d_model]
+        x = self.norm(x)
 
         if self.pooling == 'mean':
-            pooled = self._mean_pool(x, attention_mask)    # [B, d_model]
-        else:  # 'cls'
-            pooled = x[:, 0, :]                            # [B, d_model]
+            pooled = self._mean_pool(x, attention_mask)
+        else:
+            pooled = x[:, 0, :]
 
-        return self.head(pooled)        # [B, 2]
+        return self.head(pooled)
 
     def forward_explain(
         self,
-        input_ids:      torch.Tensor,   # [1, T]
-        attention_mask: torch.Tensor,   # [1, T]
+        input_ids:      torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, dict]:
         """
-        Forward pass for gradient saliency explanation.
-
-        Registers a gradient hook on the embedding output so that after
-        calling .backward() on a logit, the embedding gradients are
-        captured in the returned `grads` dict under key 'emb'.
-
-        Usage:
-            logits, grads = model.forward_explain(input_ids, mask)
-            pred = logits.argmax(-1).item()
-            logits[0, pred].backward()
-            importance = grads['emb'].norm(dim=-1).squeeze(0)  # [T]
-
-        Uses a hook instead of retain_grad() for MPS compatibility.
+        Forward pass that captures embedding gradients for saliency explanation.
+        Call .backward() on a logit after this, then read grads['emb'] for
+        per-token importance scores. Uses a hook for MPS compatibility.
         """
         grads = {}
 
-        x = self.embed(input_ids)               # [1, T, d_model]
+        x = self.embed(input_ids)
         x.register_hook(lambda g: grads.update({'emb': g}))
 
         x = self.pe(x)

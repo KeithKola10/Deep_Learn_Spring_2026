@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Training loop functions for the Transformer text classifier.
-
-No CLI here — this module is imported by run.py.
-
-Key details:
-- Optimizer: AdamW
-- Scheduler: OneCycleLR (linear warmup + cosine annealing)
-- Loss: CrossEntropyLoss
-- Gradient clipping applied before each optimizer step
-- Early stopping monitors val F1 (macro) — more robust than accuracy for
-  mildly imbalanced data
-- Best model is saved to results_dir/best_model_{model_tag}.pt
+Training loop for the Transformer classifier.
+Uses AdamW with OneCycleLR scheduling and early stopping on validation F1.
 """
 
 import os
@@ -24,10 +14,6 @@ from sklearn.metrics import f1_score, accuracy_score
 from model import TransformerClassifier
 
 
-# ──────────────────────────────────────────────
-# Single epoch
-# ──────────────────────────────────────────────
-
 def train_one_epoch(
     model:      TransformerClassifier,
     loader:     DataLoader,
@@ -37,14 +23,7 @@ def train_one_epoch(
     device:     torch.device,
     grad_clip:  float,
 ) -> tuple[float, float]:
-    """
-    Run one full training epoch.
-
-    Returns
-    -------
-    avg_loss : float — mean cross-entropy loss over all batches
-    accuracy : float — fraction of correct predictions
-    """
+    """Runs one training epoch. Returns (avg_loss, accuracy)."""
     model.train()
     total_loss = 0.0
     all_preds  = []
@@ -69,14 +48,8 @@ def train_one_epoch(
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
 
-    avg_loss = total_loss / len(loader)
-    accuracy = accuracy_score(all_labels, all_preds)
-    return avg_loss, accuracy
+    return total_loss / len(loader), accuracy_score(all_labels, all_preds)
 
-
-# ──────────────────────────────────────────────
-# Evaluation (val or test)
-# ──────────────────────────────────────────────
 
 def evaluate_split(
     model:     TransformerClassifier,
@@ -84,15 +57,7 @@ def evaluate_split(
     criterion: nn.Module,
     device:    torch.device,
 ) -> tuple[float, float, float]:
-    """
-    Evaluate on a val or test DataLoader.
-
-    Returns
-    -------
-    avg_loss : float
-    accuracy : float
-    f1_macro : float — macro-averaged F1 across both classes
-    """
+    """Evaluates on a DataLoader. Returns (avg_loss, accuracy, macro_f1)."""
     model.eval()
     total_loss = 0.0
     all_preds  = []
@@ -118,10 +83,6 @@ def evaluate_split(
     return avg_loss, accuracy, f1_macro
 
 
-# ──────────────────────────────────────────────
-# Full training loop
-# ──────────────────────────────────────────────
-
 def run_training(
     model:               TransformerClassifier,
     train_loader:        DataLoader,
@@ -131,19 +92,10 @@ def run_training(
     model_build_options: dict,
 ) -> dict:
     """
-    Full training loop with early stopping and checkpointing.
-
-    Monitors val F1 (macro). Saves best checkpoint to
-    results_dir/best_model_{model_tag}.pt.
-
-    Returns
-    -------
-    history : dict with keys
-        'train_loss', 'train_acc',
-        'val_loss',   'val_acc',  'val_f1'
-        (each a list of per-epoch values)
+    Runs the full training loop with early stopping.
+    Monitors val F1 and saves the best checkpoint to the path in model_build_options.
+    Returns a history dict of per-epoch train/val metrics.
     """
-    tag             = model_params['model_tag']
     results_dir     = model_build_options['results_dir']
     checkpoint_path = model_build_options['checkpoint_path']
     os.makedirs(results_dir, exist_ok=True)
@@ -163,9 +115,9 @@ def run_training(
         optimizer,
         max_lr=lr,
         total_steps=total_steps,
-        pct_start=warmup_frac,         # fraction of steps used for warmup
+        pct_start=warmup_frac,
         anneal_strategy='cos',
-        div_factor=25.0,               # initial lr = max_lr / 25
+        div_factor=25.0,
         final_div_factor=1e4,
     )
 
@@ -174,7 +126,7 @@ def run_training(
         'val_loss':   [], 'val_acc':   [], 'val_f1': [],
     }
 
-    best_val_f1     = -1.0
+    best_val_f1       = -1.0
     epochs_no_improve = 0
 
     print(f"\n{'Epoch':>5}  {'TrainLoss':>9}  {'TrainAcc':>8}  "
@@ -185,9 +137,7 @@ def run_training(
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, scheduler, criterion, device, grad_clip
         )
-        val_loss, val_acc, val_f1 = evaluate_split(
-            model, val_loader, criterion, device
-        )
+        val_loss, val_acc, val_f1 = evaluate_split(model, val_loader, criterion, device)
 
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -199,9 +149,8 @@ def run_training(
         print(f"{epoch:>5}  {train_loss:>9.4f}  {train_acc:>8.4f}  "
               f"{val_loss:>8.4f}  {val_acc:>7.4f}  {val_f1:>7.4f}  {current_lr:>10.2e}")
 
-        # Checkpoint on improvement
         if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
+            best_val_f1       = val_f1
             epochs_no_improve = 0
             torch.save(model.state_dict(), checkpoint_path)
             print(f"         ↑ New best val F1: {best_val_f1:.4f}  (saved to {checkpoint_path})")

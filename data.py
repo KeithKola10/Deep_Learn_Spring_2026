@@ -1,27 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Data loading, tokenization, and DataLoader construction for HC3.
+Data loading, tokenization, and DataLoader construction.
 
-HC3 dataset structure (per row):
-    {
-        "question":        str,
-        "human_answers":   list[str],   # 1 to N human answers
-        "chatgpt_answers": list[str],   # always exactly 1 ChatGPT answer
-    }
-
-Each answer becomes an independent sample. Only the answer text is used
-(not the question) since the question is identical for both classes.
-
-Labels: 0 = human, 1 = AI (ChatGPT)
-
-Tokenization: tiktoken GPT-2 BPE.
-  - All token IDs are offset by +1 so that index 0 is reserved as PAD.
-  - Sequences longer than max_seq_len are truncated from the right.
-  - Sequences shorter than max_seq_len are right-padded with zeros.
-
-Split strategy: prompt-level stratified split (group by question, then split).
-  - Prevents leakage: the same question never appears in both train and test.
+Labels: 0 = human, 1 = AI. Each answer in the dataset becomes an independent
+sample. Splits are done at the prompt level so the same question never appears
+in both train and test sets.
 """
 
 import json
@@ -40,16 +24,7 @@ from torch.utils.data import Dataset, DataLoader
 def load_hc3(data_path: str) -> tuple[list[list[str]], list[list[int]], list[str]]:
     """
     Load HC3 from a local all.jsonl file.
-
-    Parameters
-    ----------
-    data_path : path to the HC3 directory containing all.jsonl
-
-    Returns
-    -------
-    prompt_texts  : list of lists — prompt_texts[i] is the list of answer strings for prompt i
-    prompt_labels : list of lists — prompt_labels[i][j] is the label (0=human, 1=AI) for answer j of prompt i
-    questions     : list of question strings (one per prompt, for reference only)
+    Returns prompt_texts, prompt_labels, and questions as parallel lists grouped by prompt.
     """
     jsonl_path = os.path.join(data_path, 'all.jsonl')
     if not os.path.exists(jsonl_path):
@@ -97,31 +72,27 @@ def flatten_prompts(
     prompt_texts:  list[list[str]],
     prompt_labels: list[list[int]],
 ) -> tuple[list[str], list[int]]:
-    """Flatten prompt-level lists into parallel (text, label) lists."""
+    """Flatten prompt-grouped lists into parallel (text, label) lists."""
     texts  = [ans for group in prompt_texts  for ans in group]
     labels = [lbl for group in prompt_labels for lbl in group]
     return texts, labels
 
 
 # ──────────────────────────────────────────────
-# Length statistics (call once to justify max_seq_len)
+# Length statistics
 # ──────────────────────────────────────────────
 
 def sequence_length_stats(texts: list[str], tokenizer_name: str = 'gpt2') -> None:
-    """
-    Print percentile breakdown of tokenized sequence lengths.
-    Token IDs are NOT offset here — this is purely diagnostic.
-    """
+    """Prints percentile breakdown of tokenized sequence lengths across a list of texts."""
     enc = tiktoken.get_encoding(tokenizer_name)
-    lengths = [len(enc.encode(t)) for t in texts]
-    lengths = np.array(lengths)
+    lengths = np.array([len(enc.encode(t)) for t in texts])
     print(f"Sequence length stats (n={len(lengths):,}):")
     for p in [50, 75, 90, 95, 99, 100]:
         print(f"  {p:3d}th percentile: {int(np.percentile(lengths, p)):>5d} tokens")
 
 
 # ──────────────────────────────────────────────
-# Prompt-level stratified split
+# Prompt-level split
 # ──────────────────────────────────────────────
 
 def split_prompts(
@@ -132,20 +103,15 @@ def split_prompts(
     seed:       int   = 42,
 ) -> tuple[list[str], list[int], list[str], list[int], list[str], list[int]]:
     """
-    Split at the prompt level to prevent question-level data leakage.
-    Stratified by majority class within each prompt (all-human vs has-AI).
-
-    Returns (train_texts, train_labels, val_texts, val_labels, test_texts, test_labels)
-    as flat lists.
+    Splits at the prompt level to prevent the same question appearing in multiple splits.
+    Returns (train_texts, train_labels, val_texts, val_labels, test_texts, test_labels).
     """
     rng = random.Random(seed)
-    n   = len(prompt_texts)
-
-    indices = list(range(n))
+    indices = list(range(len(prompt_texts)))
     rng.shuffle(indices)
 
-    n_train = int(n * train_frac)
-    n_val   = int(n * val_frac)
+    n_train = int(len(prompt_texts) * train_frac)
+    n_val   = int(len(prompt_texts) * val_frac)
 
     train_idx = indices[:n_train]
     val_idx   = indices[n_train:n_train + n_val]
@@ -169,52 +135,38 @@ def split_prompts(
 
 class TextClassificationDataset(Dataset):
     """
-    Tokenizes and caches all sequences at construction time.
-
-    Token IDs are offset by +1 so that 0 is PAD (tiktoken GPT-2 has no PAD token).
-    Sequences are truncated to max_seq_len from the right, then right-padded to max_seq_len.
-
-    __getitem__ returns:
-        input_ids      : LongTensor [max_seq_len]   — token IDs (0 = PAD)
-        attention_mask : BoolTensor [max_seq_len]   — True = real token, False = PAD
-        label          : LongTensor scalar
+    Tokenizes and caches sequences at construction time.
+    Token IDs are offset by +1 so index 0 is reserved as PAD.
+    Sequences are truncated to max_seq_len then right-padded to that length.
     """
 
     def __init__(
         self,
-        texts:         list[str],
-        labels:        list[int],
+        texts:          list[str],
+        labels:         list[int],
         tokenizer_name: str = 'gpt2',
-        max_seq_len:   int  = 256,
+        max_seq_len:    int = 256,
         min_answer_len: int = 20,
     ):
         enc = tiktoken.get_encoding(tokenizer_name)
 
-        self.input_ids      = []
+        self.input_ids       = []
         self.attention_masks = []
-        self.labels         = []
+        self.labels          = []
 
         skipped = 0
         for text, label in zip(texts, labels):
-            ids = enc.encode(text)
-            # +1 offset: GPT-2 token IDs become 1…50257; 0 is now PAD
-            ids = [tid + 1 for tid in ids]
+            ids = [tid + 1 for tid in enc.encode(text)]  # +1 offset; 0 = PAD
 
             if len(ids) < min_answer_len:
                 skipped += 1
                 continue
 
-            # Truncate
-            ids = ids[:max_seq_len]
-            length = len(ids)
+            ids    = ids[:max_seq_len]
+            pad_len = max_seq_len - len(ids)
 
-            # Pad
-            pad_len = max_seq_len - length
-            ids_padded  = ids + [0] * pad_len
-            mask        = [True] * length + [False] * pad_len
-
-            self.input_ids.append(torch.tensor(ids_padded, dtype=torch.long))
-            self.attention_masks.append(torch.tensor(mask, dtype=torch.bool))
+            self.input_ids.append(torch.tensor(ids + [0] * pad_len, dtype=torch.long))
+            self.attention_masks.append(torch.tensor([True] * len(ids) + [False] * pad_len, dtype=torch.bool))
             self.labels.append(torch.tensor(label, dtype=torch.long))
 
         if skipped:
@@ -232,18 +184,14 @@ class TextClassificationDataset(Dataset):
 
 
 # ──────────────────────────────────────────────
-# Top-level convenience function
+# Top-level entry point
 # ──────────────────────────────────────────────
 
 def make_dataloaders(
     model_params:        dict,
     model_build_options: dict,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    Load HC3, split at the prompt level, build datasets, and return DataLoaders.
-
-    Returns (train_loader, val_loader, test_loader)
-    """
+    """Loads the dataset, splits it, tokenizes, and returns train/val/test DataLoaders."""
     print("Loading HC3 dataset from disk...")
     prompt_texts, prompt_labels, _ = load_hc3(model_build_options['hc3_data_dir'])
 
@@ -263,10 +211,10 @@ def make_dataloaders(
     )
     print(f"  Train: {len(train_texts):,} | Val: {len(val_texts):,} | Test: {len(test_texts):,}")
 
-    tokenizer_name  = model_params['tokenizer']
-    max_seq_len     = model_params['max_seq_len']
-    min_answer_len  = model_build_options['min_answer_len']
-    batch_size      = model_build_options['batch_size']
+    tokenizer_name = model_params['tokenizer']
+    max_seq_len    = model_params['max_seq_len']
+    min_answer_len = model_build_options['min_answer_len']
+    batch_size     = model_build_options['batch_size']
 
     print("Building datasets and tokenizing...")
     train_ds = TextClassificationDataset(train_texts, train_labels, tokenizer_name, max_seq_len, min_answer_len)
